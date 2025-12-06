@@ -59,9 +59,10 @@ _find_library_old = ctypes.util.find_library
 try:
 
   def _find_library_new(name):
+    # Prefer versioned sonames that exist on most systems
     return {
-        'GL': 'libOpenGL.so',
-        'EGL': 'libEGL.so',
+        'GL': 'libOpenGL.so.0',
+        'EGL': 'libEGL.so.1',
     }.get(name, _find_library_old(name))
   util.find_library = _find_library_new
   import OpenGL.GL as gl

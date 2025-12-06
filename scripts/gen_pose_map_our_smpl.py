@@ -1,5 +1,8 @@
+from pathlib import Path
 import argparse
+import json
 import numpy  as np
+import imageio.v2 as imageio
 import torch
 from os.path import join
 import os
@@ -8,6 +11,9 @@ sys.path.append('../')
 import smplx
 import trimesh
 
+# ensure PyOpenGL uses EGL (headless)
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+from posmap_generator.lib.renderer.mesh import load_obj_mesh
 
 def render_posmap(v_minimal, faces, uvs, faces_uvs, img_size=32):
     '''
@@ -16,7 +22,7 @@ def render_posmap(v_minimal, faces, uvs, faces_uvs, img_size=32):
     uvs: the uv coordinate of vertices of the SMPL body model
     faces_uvs: the faces (triangles) on the UV map of the SMPL body model
     '''
-    from posmap_generator.lib.renderer.gl.pos_render import PosRender
+    from posmap_generator.lib.renderer.egl.egl_pos_render import PosRender
 
     # instantiate renderer
     rndr = PosRender(width=img_size, height=img_size)
@@ -25,94 +31,129 @@ def render_posmap(v_minimal, faces, uvs, faces_uvs, img_size=32):
     rndr.set_mesh(v_minimal, faces, uvs, faces_uvs)
 
     # render
-    rndr.display()
+    rndr.draw()
 
     # retrieve the rendered buffer
-    uv_pos = rndr.get_color(0)
+    uv_pos = rndr.get_color()
     uv_mask = uv_pos[:, :, 3]
     uv_pos = uv_pos[:, :, :3]
 
-    uv_mask = uv_mask.reshape(-1)
-    uv_pos = uv_pos.reshape(-1, 3)
+    uv_mask_flat = uv_mask.reshape(-1)
+    uv_pos_flat = uv_pos.reshape(-1, 3)
 
-    rendered_pos = uv_pos[uv_mask != 0.0]
+    rendered_pos = uv_pos_flat[uv_mask_flat != 0.0]
 
-    uv_pos = uv_pos.reshape(img_size, img_size, 3)
+    uv_pos = uv_pos_flat.reshape(img_size, img_size, 3)
+    uv_mask_img = uv_mask_flat.reshape(img_size, img_size)
 
     # get face_id (triangle_id) per pixel
-    face_id = uv_mask[uv_mask != 0].astype(np.int32) - 1
+    face_id = uv_mask_flat[uv_mask_flat != 0].astype(np.int32) - 1
 
     assert len(face_id) == len(rendered_pos)
 
-    return uv_pos, uv_mask, face_id
+    return uv_pos, uv_mask_img, face_id
 
 
-def save_obj(data_path, name):
-    smpl_data = torch.load( data_path + '/' + name)
-    
-    frame_num = smpl_data['body_pose'].shape[0]
-    print('frame_num', frame_num)
-    start_pose = 0
+def save_human_meshes(root_save_dir : Path):
 
-    smpl_model = smplx.SMPL(model_path ='../assets/smpl_files/smpl',  batch_size = 1)
+    motion_dir = root_save_dir / "motion"
+    track_ids = sorted(os.listdir(motion_dir))
 
-    norm_obj_dir = os.path.join(data_path, 'norm_obj')
-    os.makedirs(norm_obj_dir, exist_ok=True)
+    smplx_model_path = "/home/cizinsky/body_models/smplx"
+    smpl_model = smplx.SMPLX(model_path=smplx_model_path,
+                             batch_size=1,
+                             use_pca=False)  # hands provided as full 45D axis-angle
 
-    for pose_idx in range(start_pose, frame_num + start_pose):
-        image_key = str(pose_idx).zfill(8)
+    def load_smplx_frame(json_path: Path):
+        with open(json_path, "r") as f:
+            data = json.load(f)
 
-        cano_smpl = smpl_model.forward(betas=smpl_data['beta'],
-                                global_orient=smpl_data['body_pose'][pose_idx, :3][None],
-                                transl = smpl_data['trans'][pose_idx, :][None],
-                                # global_orient=cpose_param[:, :3],
-                                body_pose=smpl_data['body_pose'][pose_idx, 3:][None],
-                                )
-        norm_vertices = cano_smpl.vertices.detach().cpu().numpy().squeeze()
-        mesh = trimesh.Trimesh(norm_vertices, smpl_model.faces, process=False)
-        mesh.export('%s/%s.obj' % (norm_obj_dir, str(image_key)))
+        # SMPL-X expects axis-angle vectors flattened per component
+        body_pose = torch.tensor(data.get("body_pose", [[0, 0, 0]] * 21), dtype=torch.float32).reshape(1, -1)
+        left_hand = torch.tensor(data.get("lhand_pose", [[0, 0, 0]] * 15), dtype=torch.float32).reshape(1, -1)
+        right_hand = torch.tensor(data.get("rhand_pose", [[0, 0, 0]] * 15), dtype=torch.float32).reshape(1, -1)
 
+        return {
+            "betas": torch.tensor(data["betas"], dtype=torch.float32).unsqueeze(0),
+            "global_orient": torch.tensor(data["root_pose"], dtype=torch.float32).unsqueeze(0),
+            "body_pose": body_pose,
+            "left_hand_pose": left_hand,
+            "right_hand_pose": right_hand,
+            "jaw_pose": torch.tensor(data.get("jaw_pose", [0, 0, 0]), dtype=torch.float32).unsqueeze(0),
+            "leye_pose": torch.tensor(data.get("leye_pose", [0, 0, 0]), dtype=torch.float32).unsqueeze(0),
+            "reye_pose": torch.tensor(data.get("reye_pose", [0, 0, 0]), dtype=torch.float32).unsqueeze(0),
+            "transl": torch.tensor(data.get("trans", [0, 0, 0]), dtype=torch.float32).unsqueeze(0),
+        }
 
-
-def save_npz(data_path, res=128):
-    from posmap_generator.lib.renderer.mesh import load_obj_mesh
-    verts, faces, uvs, faces_uvs = load_obj_mesh(uv_template_fn, with_texture=True)
-    start_obj_num = 0
-
-    norm_obj_dir = os.path.join(data_path, 'norm_obj')
-    inp_map_dir = os.path.join(data_path, 'inp_map')
-    os.makedirs(inp_map_dir, exist_ok=True)
-    # os.makedirs(query_map_dir, exist_ok=True)
-
-    norm_obj_length = len(os.listdir(norm_obj_dir))
-    result = {}
-    for indx in range(start_obj_num, start_obj_num+norm_obj_length):
-        image_key = str(indx).zfill(8)
-        body_mesh = trimesh.load('%s/%s.obj'%(norm_obj_dir, image_key), process=False)
-
-        if res==128:
-            posmap128, _, _ = render_posmap(body_mesh.vertices, body_mesh.faces, uvs, faces_uvs, img_size=128)
-            result['posmap128'] = posmap128   
-        elif res == 256:
+    for track_id in track_ids:
         
-            posmap256, _, _ = render_posmap(body_mesh.vertices, body_mesh.faces, uvs, faces_uvs, img_size=256)
-            result['posmap256'] = posmap256
+        track_id_smpl_data_dir =  motion_dir / track_id / "smplx_params"
+        track_id_norm_obj_dir = motion_dir / track_id / "norm_obj"
+        track_id_norm_obj_dir.mkdir(parents=True, exist_ok=True)
 
-        else:
-            posmap512, _, _ = render_posmap(body_mesh.vertices, body_mesh.faces, uvs, faces_uvs, img_size=512)
-            result['posmap512'] = posmap512
+        all_smplx_params_paths = sorted(Path(track_id_smpl_data_dir).glob("*.json"))
 
-        save_fn = join(inp_map_dir, 'inp_posemap_%s_%s.npz'% (str(res), image_key))
-        np.savez(save_fn, **result)
+        for smplx_path in all_smplx_params_paths:
+            smplx_params = load_smplx_frame(smplx_path)
+
+            with torch.no_grad():
+                cano_smpl = smpl_model.forward(**smplx_params)
+
+            norm_vertices = cano_smpl.vertices.detach().cpu().numpy().squeeze()
+            mesh = trimesh.Trimesh(norm_vertices, smpl_model.faces, process=False)
+            mesh.export(track_id_norm_obj_dir / f"{smplx_path.stem}.obj")
+
+
+def save_npz(root_save_dir: Path, res: int = 128, save_png: bool = False):
+
+    path_to_smplx_template = Path("/home/cizinsky/GaussianAvatar/assets/template_mesh_smplx_uv.obj")
+    verts, faces, uvs, faces_uvs = load_obj_mesh(str(path_to_smplx_template), with_texture=True)
+
+    motion_dir = root_save_dir / "motion"
+    track_ids = sorted(os.listdir(motion_dir))
+
+    for track_id in track_ids:
+        norm_obj_dir = motion_dir / track_id / "norm_obj"
+        if not norm_obj_dir.exists():
+            continue
+
+        inp_map_dir = motion_dir / track_id / "inp_map"
+        inp_map_dir.mkdir(parents=True, exist_ok=True)
+        inp_png_dir = motion_dir / track_id / "inp_map_png"
+        if save_png:
+            inp_png_dir.mkdir(parents=True, exist_ok=True)
+
+        obj_paths = sorted(norm_obj_dir.glob("*.obj"))
+
+        for obj_path in obj_paths:
+            body_mesh = trimesh.load(str(obj_path), process=False)
+
+            posmap, uv_mask, _ = render_posmap(body_mesh.vertices, body_mesh.faces, uvs, faces_uvs, img_size=res)
+            result = {f"posmap{res}": posmap}
+
+            save_fn = inp_map_dir / f"inp_posemap_{res}_{obj_path.stem}.npz"
+            np.savez(save_fn, **result)
+
+            if save_png:
+                mask_bool = uv_mask > 0
+                vis = np.zeros_like(posmap)
+                if mask_bool.any():
+                    valid = posmap[mask_bool]
+                    vmin = valid.min(axis=0)
+                    vmax = valid.max(axis=0)
+                    scale = np.maximum(vmax - vmin, 1e-8)
+                    vis = (np.clip((posmap - vmin) / scale, 0, 1) * 255).astype(np.uint8)
+                png_path = inp_png_dir / f"inp_posemap_{res}_{obj_path.stem}.png"
+                imageio.imwrite(png_path, vis)
 
 
 if __name__ == '__main__':
-    smpl_parm_path = 'path to you data folder'
-    parms_name = 'smpl_parms.pth'
 
-    save_obj(smpl_parm_path, parms_name)
+    args = argparse.ArgumentParser()
+    args.add_argument('--root-save-dir', type=Path, required=True, help='Path to the root save directory')
+    args.add_argument('--res', type=int, default=128, choices=[128, 256, 512], help='Resolution of the pose map')
+    args.add_argument('--save-png', action='store_true', help='Also save a visualized PNG of each pose map')
+    args = args.parse_args()
 
-#    # save step by step
-    #print('saving pose_map 128 ...')
-    #save_npz(smpl_parm_path, 128)
-
+    save_human_meshes(args.root_save_dir)
+    save_npz(args.root_save_dir, res=args.res, save_png=args.save_png)
