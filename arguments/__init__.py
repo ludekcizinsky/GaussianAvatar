@@ -59,9 +59,7 @@ class ModelParams(ParamGroup):
         self.project_path = os.getcwd()
 
         # smpl and smplx model path
-        self.smpl_model_path = os.getcwd() + '/assets/smpl_files/smpl'
-        self.smplx_model_path = os.getcwd() + '/assets/smpl_files/smplx'
-        self.test_folder = os.getcwd() + '/assets/test_pose'
+        self.smplx_model_path = "/home/cizinsky/body_models/smplx"
 
         # two stage training, stage one for pose optimization and stage two for adding dynamic appearances
         self.stage1_out_path =  ''

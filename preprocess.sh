@@ -9,4 +9,6 @@ module load gcc ffmpeg
 # navigate to project directory
 cd /home/cizinsky/GaussianAvatar
 
-python scripts/gen_pose_map_our_smpl.py --root-save-dir /scratch/izar/cizinsky/thesis/preprocessing/ps_male3_casual/lhm --save-png
+root_save_dir=/scratch/izar/cizinsky/thesis/preprocessing/ps_male3_casual/lhm
+# python scripts/gen_pose_map_our_smpl.py --root-save-dir $root_save_dir --save-png
+python scripts/export_camera_params.py --root-save-dir $root_save_dir
